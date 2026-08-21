@@ -200,6 +200,18 @@ Two findings worth reading twice:
 - **~60-80x over exact search at full recall.** At efSearch=50 the heuristic
   graph returns 99.7% of the true top-10 in 88 µs vs 6,990 µs exact; at
   efSearch=100 recall is 1.000 within measurement resolution.
+**Parallel build & search** (same corpus; 9900X3D, 12 cores / 24 threads):
+
+- Batch build with striped per-node locks: **33.3s → 5.3s (6.3x)** at 24
+  threads (18,789 inserts/s), with recall@10 = 0.999 at ef=100 — quality
+  preserved. A 256-node sequential warmup seeds the scaffold first: with a
+  tiny graph, concurrent inserters cannot see each other (a node becomes
+  visible only when its reverse edges land), which measurably
+  under-connects the earliest nodes if built in parallel from the start.
+- Search on the frozen graph is lock-free: **7,859 → 41,526 queries/s**
+  (1 → 24 threads). Sub-linear scaling is expected — all threads share the
+  same memory bandwidth to the vector data.
+
 - **The neighbor-selection heuristic is not optional.** Naive "M closest"
   selection plateaus at 0.91-0.95 recall *no matter how much efSearch you
   throw at it* — at ef=400 it still trails ef=50 with the heuristic. This is
@@ -280,7 +292,10 @@ needed) and the "answer" echoes the assembled prompt for inspection.
 - [x] HNSW index — heuristic neighbor selection (simple behind a flag),
       flat adjacency arrays, epoch-stamped visited pool, neighbor prefetch;
       recall@10 = 1.00 at 60x over exact search (n=100k, dim=768, ef=100)
-      (phase 1 concurrency: sequential build, frozen-graph concurrent search)
+- [x] Concurrency phase 2: parallel batch build (striped per-node mutexes,
+      atomic work dispenser, stateless per-id levels, sequential warmup) —
+      6.3x build speedup at recall 0.999; lock-free searches scale to
+      41.5k queries/s on 24 threads
 - [x] HNSW benchmark: recall/latency curve over efSearch, heuristic vs
       simple selection at scale
 - [ ] Persistence (save/load index to disk)

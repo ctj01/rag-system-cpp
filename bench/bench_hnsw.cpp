@@ -14,11 +14,13 @@
  *
  * Usage: vecdb_bench_hnsw [n] [dim]   (defaults: 50000 768)
  */
+#include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <memory>
 #include <cstdlib>
+#include <memory>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include "core/hnsw_index.hpp"
@@ -94,7 +96,8 @@ int main(int argc, char** argv) {
     vecdb::HnswConfig cfg_s = cfg_h;
     cfg_s.use_heuristic = false;
 
-    auto build = [&](const vecdb::HnswConfig& cfg, const char* label) {
+    double seq_build_s = 0.0;
+    auto build = [&](const vecdb::HnswConfig& cfg, const char* label, double* out_s) {
         auto index = std::make_unique<vecdb::HnswIndex>(dim, cfg);
         const auto t0 = Clock::now();
         for (std::size_t i = 0; i < n; ++i) {
@@ -105,13 +108,14 @@ int main(int argc, char** argv) {
             }
         }
         const double dt = seconds_since(t0);
+        if (out_s) *out_s = dt;
         std::printf("build %-9s: %.1fs (%.0f inserts/s, max_level=%d)\n\n", label, dt,
                     n / dt, index->max_level());
         return index;
     };
 
-    const auto hnsw_h = build(cfg_h, "heuristic");
-    const auto hnsw_s = build(cfg_s, "simple");
+    const auto hnsw_h = build(cfg_h, "heuristic", &seq_build_s);
+    const auto hnsw_s = build(cfg_s, "simple", nullptr);
 
     // ---- ground truth + brute-force latency baseline ----------------------
     std::vector<std::vector<vecdb::SearchResult>> exact;
@@ -144,8 +148,45 @@ int main(int argc, char** argv) {
         std::printf("%-6zu | %9.3f %10.0fus | %9.3f %10.0fus\n", ef, rh, uh, rs, us);
     }
 
-    std::printf("\nspeedup at ef=100 vs exact: see table (both indexes searched the\n"
-                "same %d queries; recall measured against the exact top-%zu).\n",
-                n_queries, k);
+    // ---- parallel batch build ----------------------------------------------
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    {
+        vecdb::HnswIndex par(dim, cfg_h);
+        const auto t0 = Clock::now();
+        par.add_batch(corpus, 0);
+        const double dt = seconds_since(t0);
+
+        double rec = 0.0;
+        for (int i = 0; i < n_queries; ++i) {
+            rec += recall_at_k(exact[i], par.search(queries[i], k, 100));
+        }
+        std::printf("\nparallel build (%u threads): %.1fs (%.0f inserts/s), %.1fx vs "
+                    "sequential %.1fs; recall@%zu (ef=100) = %.3f\n",
+                    hw, dt, n / dt, seq_build_s / dt, seq_build_s, k, rec / n_queries);
+    }
+
+    // ---- parallel search throughput (frozen graph, lock-free) --------------
+    {
+        std::printf("\nparallel search on the frozen graph (ef=100):\n");
+        constexpr int total_q = 2000;
+        for (const unsigned t : {1u, 8u, hw}) {
+            std::atomic<int> next{0};
+            const auto t0 = Clock::now();
+            std::vector<std::thread> workers;
+            for (unsigned w = 0; w < t; ++w) {
+                workers.emplace_back([&] {
+                    while (true) {
+                        const int i = next.fetch_add(1);
+                        if (i >= total_q) break;
+                        hnsw_h->search(queries[static_cast<std::size_t>(i) % n_queries],
+                                       k, 100);
+                    }
+                });
+            }
+            for (auto& w : workers) w.join();
+            const double dt = seconds_since(t0);
+            std::printf("  %2u thread(s): %8.0f queries/s\n", t, total_q / dt);
+        }
+    }
     return 0;
 }

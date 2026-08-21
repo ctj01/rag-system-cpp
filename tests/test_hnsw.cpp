@@ -10,9 +10,11 @@
  */
 #include "core/hnsw_index.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <random>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "core/vector_index.hpp"
@@ -169,6 +171,69 @@ int main() {
         std::printf("clustered recall@%zu: heuristic=%.3f simple=%.3f\n", k, rh, rs);
         CHECK(rh >= 0.90);
         CHECK(rh >= rs - 0.02);  // heuristic never meaningfully worse
+    }
+
+    // Parallel batch build. The resulting graph depends on thread
+    // interleaving (documented trade-off), so we assert recall bounds and
+    // connectivity, not exact structure.
+    {
+        vecdb::HnswIndex par(dim);
+        CHECK(par.add_batch(corpus, 8) == n);
+        CHECK(par.size() == n);
+
+        std::mt19937 qrng(555);
+        double total = 0.0;
+        for (int qi = 0; qi < 30; ++qi) {
+            const auto q = random_vec(qrng, dim);
+            total += recall_at_k(oracle.search(q, k), par.search(q, k, 100));
+        }
+        std::printf("recall@%zu (parallel build, 8 threads): %.3f\n", k, total / 30);
+        CHECK(total / 30 >= 0.90);
+
+        // Random sample across the whole id range (early ids are warmup-built,
+        // late ids are parallel-built — sample both regimes).
+        std::mt19937 pick(999);
+        std::uniform_int_distribution<std::uint32_t> ids(0, static_cast<std::uint32_t>(n - 1));
+        int found = 0;
+        for (int s = 0; s < 200; ++s) {
+            const std::uint32_t i = ids(pick);
+            const auto r = par.search(corpus[i], 1, 50);
+            if (!r.empty() && r[0].id == i) ++found;
+        }
+        std::printf("self-retrieval top-1 (parallel build): %d/200\n", found);
+        CHECK(found >= 192);  // small slack: the parallel graph is interleaving-dependent
+    }
+
+    // Concurrent frozen-graph search: 8 threads must produce results
+    // identical to a serial pass (search is lock-free and read-only).
+    {
+        std::mt19937 qrng(777);
+        std::vector<std::vector<float>> qs;
+        for (int i = 0; i < 32; ++i) qs.push_back(random_vec(qrng, dim));
+        std::vector<std::vector<vecdb::SearchResult>> serial;
+        for (const auto& q : qs) serial.push_back(hnsw.search(q, k, 100));
+
+        std::atomic<int> mismatches{0};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 8; ++t) {
+            threads.emplace_back([&] {
+                for (std::size_t i = 0; i < qs.size(); ++i) {
+                    const auto r = hnsw.search(qs[i], k, 100);
+                    if (r.size() != serial[i].size()) {
+                        ++mismatches;
+                        continue;
+                    }
+                    for (std::size_t j = 0; j < r.size(); ++j) {
+                        if (r[j].id != serial[i][j].id) {
+                            ++mismatches;
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+        CHECK(mismatches == 0);
     }
 
     // Validation and edge cases.

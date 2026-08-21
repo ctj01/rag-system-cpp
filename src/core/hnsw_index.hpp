@@ -9,26 +9,29 @@
  * Design decisions (see project README / design notes):
  *  - Flat adjacency storage: layer-0 links live in one contiguous array with
  *    fixed-capacity slots per node; upper-layer links (only ~1/M of nodes
- *    have any) live in a separate flat block, allocated once per node at
- *    insertion (a node's level never changes).
+ *    have any) live in a separate flat block.
  *  - Neighbor selection uses the diversity heuristic (Algorithm 4) by
- *    default, with keep-pruned refill; the naive "M closest" selection is
- *    available behind a flag for recall comparison benchmarks.
- *  - Reverse-edge overflow is re-pruned with the same heuristic, never by
- *    dropping the farthest neighbor.
- *  - Visited tracking uses epoch-stamped arrays from a pool (no hashing or
- *    per-query allocation in the hot path); the pool makes read-only
- *    searches safe to run concurrently on a frozen graph.
- *  - Concurrency phase 1: single-threaded build, then freeze; searches are
- *    const and thread-safe against each other (NOT against add()).
+ *    default, with keep-pruned refill; naive "M closest" behind a flag.
+ *  - Reverse-edge overflow is re-pruned with the same heuristic.
+ *  - Visited tracking uses epoch-stamped arrays from a pool.
+ *
+ * Concurrency model:
+ *  - add(): single writer.
+ *  - add_batch(): parallel build. All storage is pre-allocated up front (no
+ *    reallocation while threads run), levels are a pure function of
+ *    (seed, id) so no shared RNG, adjacency lists are protected by striped
+ *    per-node mutexes, and the entry point sits behind its own mutex taken
+ *    only when an insert introduces a new top layer (rare: ~1/M^level).
+ *  - search(): lock-free; safe from any number of threads once the build is
+ *    finished (frozen graph). NOT safe concurrently with add()/add_batch().
  */
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <random>
 #include <span>
 #include <vector>
 
@@ -38,22 +41,11 @@ namespace vecdb {
 
 /**
  * @brief Tunables for HnswIndex.
- *
- * @details Trade-offs:
- *  - M: graph degree (layers >= 1); layer 0 caps at 2*M. Higher M = better
- *    recall and more memory; structural, cannot change after build.
- *  - ef_construction: beam width during insertion. Buys graph quality once,
- *    at build time; diminishing returns past ~200.
- *  - The search-time beam (ef_search) is a search() parameter, not stored
- *    config — it is the runtime recall/latency knob.
  */
-// [C#→C++] Default member initializers work like C# auto-property
-// initializers; brace-init `HnswConfig{.M = 32}` (designated initializers,
-// C++20) is the closest thing to named arguments.
 struct HnswConfig {
     std::size_t M = 16;                ///< Max degree per node, layers >= 1.
     std::size_t ef_construction = 200; ///< Beam width during insertion.
-    std::uint64_t seed = 42;           ///< RNG seed for level assignment (reproducible builds).
+    std::uint64_t seed = 42;           ///< Level-assignment seed (levels are f(seed, id)).
     bool use_heuristic = true;         ///< Diversity heuristic vs naive M-closest selection.
     bool keep_pruned = true;           ///< Refill up to M with pruned candidates.
 };
@@ -63,36 +55,44 @@ struct HnswConfig {
  *        brute-force VectorIndex for large n.
  *
  * Vectors are L2-normalized on insertion (cosine == dot). Internally
- * distances are d = 1 - dot, so "smaller is closer" like the paper's
- * pseudocode; scores returned to callers are cosine similarities.
+ * distances are d = 1 - dot ("smaller is closer"); scores returned to
+ * callers are cosine similarities.
  */
 class HnswIndex {
 public:
-    /**
-     * @brief Constructs an empty index.
-     * @param dim Vector dimensionality; must be > 0.
-     * @param config Tunables; defaults are sane for text embeddings.
-     * @throws std::invalid_argument if dim == 0 or config.M < 2.
-     */
     explicit HnswIndex(std::size_t dim, HnswConfig config = {});
 
     /**
-     * @brief Inserts a vector (copied, L2-normalized). Single-threaded.
+     * @brief Inserts one vector (copied, L2-normalized). Single-threaded.
      * @return The id assigned (insertion order, 0-based).
      * @throws std::invalid_argument on dimension mismatch or zero norm.
      */
     std::uint32_t add(std::span<const float> vec);
 
     /**
+     * @brief Inserts a batch of vectors, building the graph on @p n_threads.
+     *
+     * Validates every vector first (strong guarantee: on throw, the index is
+     * unchanged), pre-allocates all storage, then links nodes in parallel.
+     * Ids are assigned contiguously starting at the current size().
+     *
+     * @param vectors Batch to insert.
+     * @param n_threads 0 = hardware concurrency.
+     * @return Number of vectors inserted.
+     * @throws std::invalid_argument on any dimension mismatch or zero norm.
+     * @note The resulting graph depends on thread interleaving (documented
+     *       trade-off); node LEVELS are still deterministic per (seed, id).
+     */
+    std::size_t add_batch(std::span<const std::vector<float>> vectors, int n_threads = 0);
+
+    /**
      * @brief Approximate top-k by cosine similarity.
      * @param query Raw (un-normalized) query vector.
      * @param k Number of results; clamped to size().
-     * @param ef_search Beam width at layer 0; clamped up to k. Higher =
-     *        better recall, ~linearly more latency. 50-200 typical.
-     * @return Results sorted by descending score. Approximate: may miss
-     *         true neighbors (measure recall against VectorIndex).
-     * @note Thread-safe against other search() calls once the build is
-     *       finished (frozen graph); NOT safe concurrently with add().
+     * @param ef_search Beam width at layer 0; clamped up to k.
+     * @return Results sorted by descending score.
+     * @note Lock-free and thread-safe against other search() calls on a
+     *       frozen graph; NOT safe concurrently with add()/add_batch().
      */
     std::vector<SearchResult> search(std::span<const float> query, std::size_t k,
                                      std::size_t ef_search = 100) const;
@@ -109,11 +109,7 @@ private:
     };
 
     /**
-     * @brief Pool of epoch-stamped visited lists.
-     *
-     * Marking a node visited is one store; checking is one compare;
-     * "clearing" between queries is ++epoch (O(1), no memset). The pool
-     * hands each concurrent search its own list.
+     * @brief Pool of epoch-stamped visited lists (one per in-flight search).
      */
     class VisitedPool {
     public:
@@ -128,10 +124,9 @@ private:
             }
         };
 
-        // [C#→C++] Move-only RAII lease (cf. SafeHandle + using in C#): the
+        // [C#→C++] Move-only RAII lease (cf. SafeHandle + using): the
         // destructor returns the list to the pool automatically, even on
-        // exceptions. Copying is implicitly disabled because unique_ptr is
-        // move-only — the compiler enforces single ownership at compile time.
+        // exceptions. Copying is a compile error (unique_ptr is move-only).
         class Lease {
         public:
             Lease(VisitedPool* pool, std::unique_ptr<List> list)
@@ -149,7 +144,6 @@ private:
             std::unique_ptr<List> list_;
         };
 
-        /// Returns a list sized for n nodes with a fresh epoch.
         Lease acquire(std::size_t n);
 
     private:
@@ -164,30 +158,36 @@ private:
     }
     float dist_to(std::span<const float> q, std::uint32_t id) const;
 
-    /// Adjacency slot for @p id at @p level: pointer to [count, id0, id1...].
     std::uint32_t* links(std::uint32_t id, int level);
     const std::uint32_t* links(std::uint32_t id, int level) const;
     std::size_t max_degree(int level) const {
         return level == 0 ? mmax0_ : cfg_.M;
     }
 
-    int random_level();
+    /// Level as a pure function of (seed, id): no shared RNG state, so
+    /// parallel builders need no synchronization, and levels are
+    /// reproducible regardless of insertion interleaving.
+    int level_for(std::uint32_t id) const;
 
-    /// Greedy ef=1 descent within one layer; returns the closest node found.
-    std::uint32_t greedy_closest(std::span<const float> q, std::uint32_t ep, int level) const;
+    std::mutex& stripe(std::uint32_t id) const {
+        return link_locks_[id % kStripes];
+    }
 
-    /// Beam search within one layer; returns candidates sorted ascending by d.
+    std::uint32_t greedy_closest(std::span<const float> q, std::uint32_t ep, int level,
+                                 bool locked) const;
     std::vector<Candidate> search_layer(std::span<const float> q, std::uint32_t ep,
-                                        std::size_t ef, int level) const;
-
-    /// Selects up to m neighbors from candidates (sorted ascending) for a
-    /// node whose vector is @p base — heuristic or simple per config.
+                                        std::size_t ef, int level, bool locked) const;
     std::vector<Candidate> select_neighbors(std::span<const float> base,
                                             const std::vector<Candidate>& candidates,
                                             std::size_t m) const;
+    void add_link(std::uint32_t node, std::uint32_t cand, int level, bool locked);
 
-    /// Adds edge node->cand; if the slot is full, re-prunes with the heuristic.
-    void add_link(std::uint32_t node, std::uint32_t cand, int level);
+    /// Wires node @p id into the graph (both edge directions, all layers).
+    /// Storage for the node must already exist. locked = parallel build.
+    void insert_node(std::uint32_t id, bool locked);
+
+    /// Appends storage (vector data, level, zeroed link slots) for one node.
+    std::uint32_t append_node_storage(std::span<const float> v, float inv_norm);
 
     std::size_t dim_;
     HnswConfig cfg_;
@@ -200,22 +200,24 @@ private:
 
     // Layer 0: fixed slots of (1 + mmax0_) uint32 per node: [count, ids...].
     std::vector<std::uint32_t> links0_;
-    // Layers >= 1: per node with level L >= 1, a block of L*(1+M) uint32,
-    // appended once at insertion. upper_offset_[id] indexes into upper_
-    // (npos when the node lives only in layer 0).
+    // Layers >= 1: per node with level L >= 1, a block of L*(1+M) uint32.
     static constexpr std::size_t kNoUpper = static_cast<std::size_t>(-1);
     std::vector<std::size_t> upper_offset_;
     std::vector<std::uint32_t> upper_;
 
     std::uint32_t entry_ = 0;
     int max_level_ = -1;  ///< -1 while empty.
-    std::mt19937_64 rng_;
 
-    // [C#→C++] mutable = "this member may change inside const methods".
-    // search() is logically read-only (the graph doesn't change) but needs
-    // scratch space; mutable is the idiom for caches/scratch that don't
-    // affect observable state. No C# equivalent — const-correctness itself
-    // has no C# counterpart.
+    // Striped adjacency locks: 64 mutexes shared across all nodes (id % 64).
+    // Full per-node mutexes would cost 40 bytes each; striping trades a
+    // little false contention for constant memory. Only the build path locks
+    // them — frozen-graph searches never touch these.
+    static constexpr std::size_t kStripes = 64;
+    mutable std::array<std::mutex, kStripes> link_locks_;
+    std::mutex entry_mutex_;  ///< Guards entry_/max_level_ during parallel build.
+
+    // [C#→C++] mutable: scratch that may change inside const methods without
+    // affecting observable state (no C# equivalent; C# lacks const methods).
     mutable VisitedPool visited_pool_;
 };
 
