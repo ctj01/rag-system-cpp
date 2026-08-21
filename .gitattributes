@@ -1,0 +1,3 @@
+# Normalize to LF in the repo and on checkout: the project is built from
+# WSL/Linux; keeping one line-ending convention avoids phantom diffs.
+* text=auto eol=lf

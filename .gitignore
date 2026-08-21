@@ -1,0 +1,12 @@
+# CMake build trees
+build/
+cmake-build-*/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# OS noise
+Thumbs.db
+.DS_Store
