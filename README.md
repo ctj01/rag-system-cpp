@@ -1,5 +1,7 @@
 # vecdb — a hand-rolled vector search engine (with a RAG demo on top)
 
+[![CI](https://github.com/ctj01/rag-system-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/ctj01/rag-system-cpp/actions/workflows/ci.yml)
+
 A vector similarity search engine written from scratch in **C++20**, with a
 local RAG (Retrieval-Augmented Generation) pipeline built on top as a demo.
 Everything runs locally — no external APIs.
