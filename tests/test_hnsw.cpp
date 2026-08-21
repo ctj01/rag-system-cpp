@@ -236,6 +236,39 @@ int main() {
         CHECK(mismatches == 0);
     }
 
+    // Persistence: save → load → bit-identical search results.
+    {
+        const char* path = "test_hnsw_index.bin";
+        hnsw.save(path);
+        const auto loaded = vecdb::HnswIndex::load(path);
+        CHECK(loaded.size() == hnsw.size());
+        CHECK(loaded.dim() == hnsw.dim());
+        CHECK(loaded.max_level() == hnsw.max_level());
+
+        std::mt19937 qrng(1234);
+        for (int qi = 0; qi < 10; ++qi) {
+            const auto q = random_vec(qrng, dim);
+            const auto a = hnsw.search(q, k, 100);
+            const auto b = loaded.search(q, k, 100);
+            CHECK(a.size() == b.size());
+            for (std::size_t j = 0; j < a.size(); ++j) {
+                CHECK(a[j].id == b[j].id);
+                CHECK(a[j].score == b[j].score);  // same graph -> bit-exact
+            }
+        }
+        std::remove(path);
+
+        // Corrupted file: wrong magic must throw, not crash.
+        {
+            std::FILE* f = std::fopen(path, "wb");
+            std::fputs("garbage that is not an index", f);
+            std::fclose(f);
+        }
+        CHECK_THROWS(vecdb::HnswIndex::load(path), std::runtime_error);
+        std::remove(path);
+        CHECK_THROWS(vecdb::HnswIndex::load("no_such_file.bin"), std::runtime_error);
+    }
+
     // Validation and edge cases.
     {
         vecdb::HnswIndex empty(dim);

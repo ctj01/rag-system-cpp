@@ -30,9 +30,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iosfwd>
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "core/vector_index.hpp"  // SearchResult
@@ -101,7 +103,30 @@ public:
     std::size_t dim() const noexcept { return dim_; }
     int max_level() const noexcept { return max_level_; }
 
+    /**
+     * @brief Serializes the full index (config, vectors, graph) to a binary
+     *        file. The format is little-endian/x86-64 native (documented
+     *        non-portability; this is a local cache, not an exchange format).
+     * @throws std::runtime_error on I/O failure.
+     */
+    void save(const std::string& path) const;
+
+    /**
+     * @brief Loads an index written by save(). Full graph state is restored:
+     *        searches return bit-identical results to the saved instance.
+     * @throws std::runtime_error on I/O failure, bad magic, or version
+     *         mismatch.
+     */
+    // [C#→C++] Returning HnswIndex BY VALUE despite it containing
+    // std::mutex members (which can be neither copied nor moved) works
+    // because of C++17 guaranteed copy elision: `return HnswIndex(...)` is a
+    // prvalue, constructed directly in the caller's storage — no move ever
+    // happens. Naming the local first would not compile.
+    static HnswIndex load(const std::string& path);
+
 private:
+    /// Deserializing constructor: header already validated/consumed by load().
+    HnswIndex(std::size_t dim, HnswConfig config, std::istream& in);
     /// One entry in the search beams: distance (1 - dot) plus node id.
     struct Candidate {
         float d;

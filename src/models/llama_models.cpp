@@ -157,6 +157,15 @@ public:
         vocab_ = llama_model_get_vocab(model_.get());
 
         sampler_.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        // Repeat penalty first in the chain: greedy decoding on small models
+        // degenerates into loops without it (observed with Qwen2.5-0.5B).
+        if (options.repeat_penalty > 1.0f && options.repeat_last_n > 0) {
+            llama_sampler_chain_add(
+                sampler_.get(),
+                llama_sampler_init_penalties(llama_vocab_n_tokens(vocab_),
+                                             options.repeat_last_n,
+                                             options.repeat_penalty, 0.0f, 0.0f));
+        }
         if (options.temperature > 0.0f) {
             llama_sampler_chain_add(sampler_.get(),
                                     llama_sampler_init_temp(options.temperature));
@@ -167,12 +176,41 @@ public:
             // (we want the evidence to drive the answer, not the sampler).
             llama_sampler_chain_add(sampler_.get(), llama_sampler_init_greedy());
         }
+        use_chat_template_ = options.use_chat_template &&
+                             llama_model_chat_template(model_.get(), nullptr) != nullptr;
     }
 
     std::string generate(std::string_view prompt) override {
         std::lock_guard<std::mutex> lock(mu_);
 
-        auto tokens = tokenize(vocab_, prompt, /*add_special=*/true);
+        // Instruct models are trained INSIDE their chat template; a raw
+        // completion prompt puts them out of distribution. Wrap the RAG
+        // prompt as a single user turn when the model ships a template.
+        std::string templated;
+        bool add_special = true;
+        if (use_chat_template_) {
+            const std::string prompt_z(prompt);  // template API needs a C string
+            const llama_chat_message msg{"user", prompt_z.c_str()};
+            const char* tmpl = llama_model_chat_template(model_.get(), nullptr);
+            std::vector<char> buf(prompt_z.size() * 2 + 512);
+            int32_t n = llama_chat_apply_template(tmpl, &msg, 1, /*add_ass=*/true,
+                                                  buf.data(),
+                                                  static_cast<int32_t>(buf.size()));
+            if (n > static_cast<int32_t>(buf.size())) {  // rare: template expands a lot
+                buf.resize(static_cast<std::size_t>(n));
+                n = llama_chat_apply_template(tmpl, &msg, 1, true, buf.data(),
+                                              static_cast<int32_t>(buf.size()));
+            }
+            if (n > 0) {
+                templated.assign(buf.data(), static_cast<std::size_t>(n));
+                prompt = templated;
+                // The template text already contains BOS/special markers:
+                // adding another BOS would double it.
+                add_special = false;
+            }
+        }
+
+        auto tokens = tokenize(vocab_, prompt, add_special);
         if (tokens.empty()) return {};
         // Leave room in the context window for the completion.
         const std::size_t budget = llama_n_ctx(ctx_.get());
@@ -216,6 +254,7 @@ private:
     SamplerPtr sampler_;
     const llama_vocab* vocab_ = nullptr;
     int max_new_tokens_;
+    bool use_chat_template_ = false;
     llama_token last_token_ = 0;
     std::mutex mu_;
 };

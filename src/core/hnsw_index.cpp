@@ -9,10 +9,13 @@
 #include <atomic>
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <exception>
+#include <fstream>
 #include <queue>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <xmmintrin.h>  // _mm_prefetch (SSE, baseline on x86-64)
 
 #include "core/dot.hpp"
@@ -487,6 +490,140 @@ std::size_t HnswIndex::add_batch(std::span<const std::vector<float>> vectors,
 
     if (error) std::rethrow_exception(error);
     return vectors.size();
+}
+
+// --------------------------------------------------------------- persistence
+
+namespace {
+
+constexpr char kMagic[4] = {'V', 'D', 'B', 'H'};
+constexpr std::uint32_t kFormatVersion = 1;
+
+// [C#→C++] Binary I/O the C++ way: for trivially-copyable types the object's
+// bytes ARE the serialization (no reflection, no BinaryWriter per-field
+// calls). static_assert makes "this type is safe to memcpy" a compile-time
+// contract — pointers or non-POD members in T would make this silently wrong,
+// so the assert guards refactors.
+template <typename T>
+void write_pod(std::ostream& out, const T& v) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    out.write(reinterpret_cast<const char*>(&v), sizeof(T));
+}
+
+template <typename T>
+void read_pod(std::istream& in, T& v) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    in.read(reinterpret_cast<char*>(&v), sizeof(T));
+    if (!in) throw std::runtime_error("HnswIndex::load: truncated file");
+}
+
+template <typename T>
+void write_vec(std::ostream& out, const std::vector<T>& v) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    write_pod(out, static_cast<std::uint64_t>(v.size()));
+    out.write(reinterpret_cast<const char*>(v.data()),
+              static_cast<std::streamsize>(sizeof(T) * v.size()));
+}
+
+template <typename T>
+void read_vec(std::istream& in, std::vector<T>& v) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    std::uint64_t n = 0;
+    read_pod(in, n);
+    v.resize(n);
+    in.read(reinterpret_cast<char*>(v.data()),
+            static_cast<std::streamsize>(sizeof(T) * n));
+    if (!in) throw std::runtime_error("HnswIndex::load: truncated file");
+}
+
+}  // namespace
+
+void HnswIndex::save(const std::string& path) const {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) throw std::runtime_error("HnswIndex::save: cannot open " + path);
+
+    out.write(kMagic, sizeof(kMagic));
+    write_pod(out, kFormatVersion);
+    write_pod(out, static_cast<std::uint64_t>(dim_));
+    write_pod(out, static_cast<std::uint64_t>(cfg_.M));
+    write_pod(out, static_cast<std::uint64_t>(cfg_.ef_construction));
+    write_pod(out, cfg_.seed);
+    write_pod(out, static_cast<std::uint8_t>(cfg_.use_heuristic));
+    write_pod(out, static_cast<std::uint8_t>(cfg_.keep_pruned));
+
+    write_pod(out, static_cast<std::uint64_t>(count_));
+    write_pod(out, entry_);
+    write_pod(out, static_cast<std::int32_t>(max_level_));
+
+    write_vec(out, data_);
+    write_vec(out, levels_);
+    write_vec(out, links0_);
+    write_vec(out, upper_offset_);
+    write_vec(out, upper_);
+
+    out.flush();
+    if (!out) throw std::runtime_error("HnswIndex::save: write failed: " + path);
+}
+
+HnswIndex::HnswIndex(std::size_t dim, HnswConfig config, std::istream& in)
+    // [C#→C++] Delegating constructor (= C# `: this(...)`) — validation and
+    // derived members (mmax0_, ml_) come from the normal constructor.
+    : HnswIndex(dim, config) {
+    std::uint64_t count = 0;
+    std::int32_t top = 0;
+    read_pod(in, count);
+    read_pod(in, entry_);
+    read_pod(in, top);
+    max_level_ = top;
+    count_ = count;
+
+    read_vec(in, data_);
+    read_vec(in, levels_);
+    read_vec(in, links0_);
+    read_vec(in, upper_offset_);
+    read_vec(in, upper_);
+
+    // Structural sanity: catches truncated/corrupted payloads that happen to
+    // parse. Cheap compared to debugging a graph with wild indices later.
+    if (data_.size() != count_ * dim_ || levels_.size() != count_ ||
+        links0_.size() != count_ * (1 + mmax0_) || upper_offset_.size() != count_ ||
+        (count_ > 0 && entry_ >= count_)) {
+        throw std::runtime_error("HnswIndex::load: inconsistent index data");
+    }
+}
+
+HnswIndex HnswIndex::load(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("HnswIndex::load: cannot open " + path);
+
+    char magic[4] = {};
+    in.read(magic, sizeof(magic));
+    if (!in || std::memcmp(magic, kMagic, sizeof(kMagic)) != 0) {
+        throw std::runtime_error("HnswIndex::load: not a vecdb index file: " + path);
+    }
+    std::uint32_t version = 0;
+    read_pod(in, version);
+    if (version != kFormatVersion) {
+        throw std::runtime_error("HnswIndex::load: unsupported format version");
+    }
+
+    std::uint64_t dim = 0, m = 0, efc = 0;
+    read_pod(in, dim);
+    read_pod(in, m);
+    read_pod(in, efc);
+    HnswConfig cfg;
+    cfg.M = m;
+    cfg.ef_construction = efc;
+    read_pod(in, cfg.seed);
+    std::uint8_t heuristic = 1, keep = 1;
+    read_pod(in, heuristic);
+    read_pod(in, keep);
+    cfg.use_heuristic = heuristic != 0;
+    cfg.keep_pruned = keep != 0;
+
+    // Guaranteed copy elision: this prvalue is constructed directly in the
+    // caller's storage — required, since the mutex members are unmovable.
+    return HnswIndex(dim, cfg, in);
 }
 
 }  // namespace vecdb

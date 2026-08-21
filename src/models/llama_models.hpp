@@ -25,6 +25,13 @@ struct LlamaModelOptions {
     int max_new_tokens = 256;      ///< Generator: completion length cap.
     float temperature = 0.0f;      ///< Generator: <= 0 means greedy decoding.
     std::uint32_t seed = 42;       ///< Generator sampling seed (when temperature > 0).
+    float repeat_penalty = 1.15f;  ///< Generator: > 1 penalizes repeated tokens
+                                   ///< (1.0 = off). Greedy decoding on small
+                                   ///< models loops without this.
+    int repeat_last_n = 256;       ///< Window of recent tokens the penalty sees.
+    bool use_chat_template = true; ///< Generator: wrap the prompt with the
+                                   ///< model's chat template (instruct models
+                                   ///< behave far better inside their template).
 };
 
 /**

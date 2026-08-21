@@ -298,7 +298,11 @@ needed) and the "answer" echoes the assembled prompt for inspection.
       41.5k queries/s on 24 threads
 - [x] HNSW benchmark: recall/latency curve over efSearch, heuristic vs
       simple selection at scale
-- [ ] Persistence (save/load index to disk)
+- [x] Persistence: binary save/load of the full HNSW state (config, vectors,
+      graph) — loaded indexes return bit-identical search results
+- [x] Generator quality: repeat penalty + the model's chat template (instruct
+      models answer concisely inside their template; raw completion prompts
+      made small models ramble)
 
 ## Notes for readers coming from C#
 
