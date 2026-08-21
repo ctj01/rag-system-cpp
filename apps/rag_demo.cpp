@@ -1,22 +1,29 @@
 /**
  * @file rag_demo.cpp
- * @brief Interactive RAG demo over a built-in sample corpus (stub models).
+ * @brief Interactive RAG demo over a built-in sample corpus.
  *
  * Usage:
- *   rag_demo                     # interactive: type questions, empty line exits
- *   rag_demo what is a hedge...  # one-shot: argv joined as the question
+ *   rag_demo [--embed-model path.gguf] [--gen-model path.gguf] [question...]
  *
- * With the stub models the "answer" is the echoed prompt — which makes the
- * whole pipeline inspectable: you see exactly the evidence and instructions
- * a real LLM would receive once llama.cpp lands behind the same interfaces.
+ *   rag_demo                          # stubs, interactive (empty line exits)
+ *   rag_demo what is a hedge ratio    # stubs, one-shot
+ *   rag_demo --embed-model minilm.gguf --gen-model qwen.gguf   # real models
+ *
+ * With the stub models the "answer" is the echoed prompt — the pipeline is
+ * fully inspectable. With GGUF paths the same pipeline runs real local
+ * inference through llama.cpp behind the same interfaces.
  */
 #include <cstdio>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "models/embedding_model.hpp"
 #include "models/generator.hpp"
 #include "rag/rag_pipeline.hpp"
+#ifdef VECDB_WITH_LLAMA
+#include "models/llama_models.hpp"
+#endif
 
 namespace {
 
@@ -73,8 +80,40 @@ void print_response(const vecdb::RagResponse& response) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    vecdb::RagPipeline pipeline(vecdb::make_hash_embedder(1024),
-                                vecdb::make_echo_generator());
+    // Minimal arg parsing: --embed-model / --gen-model, rest is the question.
+    std::string embed_path, gen_path;
+    std::vector<std::string> question_words;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--embed-model" && i + 1 < argc) {
+            embed_path = argv[++i];
+        } else if (arg == "--gen-model" && i + 1 < argc) {
+            gen_path = argv[++i];
+        } else {
+            question_words.push_back(arg);
+        }
+    }
+
+    std::unique_ptr<vecdb::EmbeddingModel> embedder;
+    std::unique_ptr<vecdb::Generator> generator;
+#ifdef VECDB_WITH_LLAMA
+    if (!embed_path.empty()) {
+        std::printf("loading embedding model: %s\n", embed_path.c_str());
+        embedder = vecdb::make_llama_embedder(embed_path);
+    }
+    if (!gen_path.empty()) {
+        std::printf("loading generation model: %s\n", gen_path.c_str());
+        generator = vecdb::make_llama_generator(gen_path);
+    }
+#else
+    if (!embed_path.empty() || !gen_path.empty()) {
+        std::printf("built without VECDB_WITH_LLAMA; using stubs\n");
+    }
+#endif
+    if (!embedder) embedder = vecdb::make_hash_embedder(1024);
+    if (!generator) generator = vecdb::make_echo_generator();
+
+    vecdb::RagPipeline pipeline(std::move(embedder), std::move(generator));
 
     for (const auto& doc : kCorpus) {
         const auto n = pipeline.add_document(doc.text, doc.source);
@@ -83,11 +122,11 @@ int main(int argc, char** argv) {
     std::printf("corpus ready: %zu documents, %zu chunks\n\n",
                 pipeline.document_count(), pipeline.chunk_count());
 
-    if (argc > 1) {  // one-shot: join argv into the question
+    if (!question_words.empty()) {  // one-shot
         std::string question;
-        for (int i = 1; i < argc; ++i) {
-            if (i > 1) question += ' ';
-            question += argv[i];
+        for (std::size_t i = 0; i < question_words.size(); ++i) {
+            if (i > 0) question += ' ';
+            question += question_words[i];
         }
         print_response(pipeline.ask(question, 2));
         return 0;

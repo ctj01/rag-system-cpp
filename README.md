@@ -21,7 +21,7 @@ flowchart TB
         PB --> GEN_CALL[Generation]
     end
 
-    subgraph MODELS["Model interfaces — stubs implemented (llama.cpp later)"]
+    subgraph MODELS["Model interfaces — stubs + llama.cpp backends"]
         EM["EmbeddingModel<br/><i>text → float[dim]</i>"]
         GN["Generator<br/><i>prompt → text</i>"]
     end
@@ -124,7 +124,8 @@ rag-system/
 │   ├── models/
 │   │   ├── embedding_model.hpp  # abstract interface + factory
 │   │   ├── generator.hpp        # abstract interface + factory
-│   │   └── stub_models.cpp      # HashEmbedder (feature hashing), EchoGenerator
+│   │   ├── stub_models.cpp      # HashEmbedder (feature hashing), EchoGenerator
+│   │   └── llama_models.hpp/.cpp# llama.cpp GGUF backends (RAII over the C API)
 │   └── rag/
 │       ├── chunker.hpp/.cpp     # word-window chunking with overlap
 │       └── rag_pipeline.hpp/.cpp# chunk → embed → retrieve → prompt → generate
@@ -232,6 +233,35 @@ ctest --test-dir build --output-on-failure
 The AVX2 kernel is always compiled, but only executed if the CPU reports
 AVX2 + FMA at runtime; otherwise the scalar path runs.
 
+## Real models (llama.cpp)
+
+The build fetches and compiles [llama.cpp](https://github.com/ggml-org/llama.cpp)
+(pinned tag, CPU backend) unless configured with `-DVECDB_WITH_LLAMA=OFF`.
+The llama backends implement the same `EmbeddingModel` / `Generator`
+interfaces as the stubs — the pipeline code is identical either way.
+
+Download small GGUF models (~500 MB total; any embedding/instruct GGUF works):
+
+```bash
+mkdir -p models && cd models
+curl -sL -o minilm-l6-v2.f16.gguf \
+  https://huggingface.co/second-state/All-MiniLM-L6-v2-Embedding-GGUF/resolve/main/all-MiniLM-L6-v2-ggml-model-f16.gguf
+curl -sL -o qwen2.5-0.5b-instruct-q4_k_m.gguf \
+  https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+```
+
+Then run the demo with real local inference:
+
+```bash
+./build/apps/rag_demo \
+  --embed-model models/minilm-l6-v2.f16.gguf \
+  --gen-model models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+  how does the kalman filter estimate the hedge ratio
+```
+
+Without the flags the demo runs on the deterministic stubs (no downloads
+needed) and the "answer" echoes the assembled prompt for inspection.
+
 ## Roadmap
 
 - [x] CMake skeleton (C++20, warnings, Release default)
@@ -244,7 +274,9 @@ AVX2 + FMA at runtime; otherwise the scalar path runs.
 - [x] RAG orchestration: word-window chunking with overlap → embed → HNSW
       retrieval → grounded prompt assembly (numbered passages, source
       attribution) → generate; interactive demo in `apps/rag_demo`
-- [ ] `llama.cpp` integration behind the model interfaces
+- [x] `llama.cpp` integration behind the model interfaces (pinned tag via
+      FetchContent, optional `-DVECDB_WITH_LLAMA=OFF`): GGUF embeddings with
+      mean pooling, greedy/temperature generation, RAII over the C API
 - [x] HNSW index — heuristic neighbor selection (simple behind a flag),
       flat adjacency arrays, epoch-stamped visited pool, neighbor prefetch;
       recall@10 = 1.00 at 60x over exact search (n=100k, dim=768, ef=100)

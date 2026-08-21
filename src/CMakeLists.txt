@@ -25,3 +25,12 @@ target_include_directories(vecdb_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 set_source_files_properties(core/dot_avx2.cpp PROPERTIES
     COMPILE_OPTIONS "-mavx2;-mfma"
 )
+
+# llama.cpp backends: compiled only when the dependency was fetched. PUBLIC
+# link/definition so consumers (apps) can #ifdef VECDB_WITH_LLAMA and call
+# the factories.
+if(VECDB_WITH_LLAMA)
+    target_sources(vecdb_core PRIVATE models/llama_models.cpp)
+    target_link_libraries(vecdb_core PUBLIC llama)
+    target_compile_definitions(vecdb_core PUBLIC VECDB_WITH_LLAMA)
+endif()

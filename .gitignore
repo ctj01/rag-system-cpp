@@ -2,6 +2,10 @@
 build/
 cmake-build-*/
 
+# GGUF model weights (download locally; see README)
+models/
+*.gguf
+
 # IDE
 .vs/
 .vscode/
