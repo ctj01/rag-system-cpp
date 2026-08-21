@@ -2,8 +2,10 @@
 build/
 cmake-build-*/
 
-# GGUF model weights (download locally; see README)
-models/
+# GGUF model weights (download locally; see README).
+# Leading slash anchors to the repo root: a bare "models/" would also
+# ignore src/models/ (gitignore patterns match at any depth).
+/models/
 *.gguf
 
 # IDE
